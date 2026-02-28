@@ -27,13 +27,62 @@ const formatAxiosError = (error: any): string => {
   const status = error?.response?.status;
   const data = error?.response?.data;
   if (data) {
+    // Extract clean error message from ERPNext's _server_messages (used in 417, 409, 403, etc.)
+    if (data._server_messages) {
+      try {
+        const serverMessages = JSON.parse(data._server_messages);
+        const cleanMessages = serverMessages.map((msg: string) => {
+          try {
+            const parsed = JSON.parse(msg);
+            // Strip HTML tags for cleaner output
+            return (parsed.message || parsed).replace(/<[^>]*>/g, '');
+          } catch {
+            return msg;
+          }
+        });
+        return `[${status}] ${cleanMessages.join(' | ')}`;
+      } catch {
+        // Fall through to generic handling
+      }
+    }
+    // Extract from exception field
+    if (data.exception) {
+      const match = data.exception.match(/:\s*(.+?)(?:\n|$)/);
+      if (match) {
+        return `[${status}] ${match[1].replace(/<[^>]*>/g, '')}`;
+      }
+    }
+    // Extract from exc_type
+    if (data.exc_type && data.exception) {
+      return `[${status}] ${data.exc_type}: ${data.exception.split('\n')[0]}`;
+    }
     try {
-      return `status=${status} response=${JSON.stringify(data)}`;
+      return `[${status}] ${JSON.stringify(data)}`;
     } catch {
-      return `status=${status} response=${String(data)}`;
+      return `[${status}] ${String(data)}`;
     }
   }
   return error?.message || 'Unknown error';
+};
+
+/**
+ * Convert dict-style filters to list-of-lists format for reliable Frappe API calls.
+ * Dict format: {"field": "value"} or {"field": ["operator", "value"]}
+ * List format: [["field", "=", "value"]] or [["field", "operator", "value"]]
+ * The list-of-lists format handles all operators (in, like, between, etc.) reliably.
+ */
+const normalizeFilters = (filters: Record<string, any>): any[] => {
+  const result: any[] = [];
+  for (const [field, value] of Object.entries(filters)) {
+    if (Array.isArray(value) && value.length >= 2 && typeof value[0] === 'string') {
+      // Operator format: {"field": ["operator", "operand"]}
+      result.push([field, value[0], value[1]]);
+    } else {
+      // Simple equality: {"field": "value"}
+      result.push([field, "=", value]);
+    }
+  }
+  return result;
 };
 
 // ERPNext API client configuration
@@ -90,13 +139,15 @@ class ERPNextClient {
   }
 
   // Submit a document (docstatus = 1)
+  // Uses PUT API to avoid race condition with frappe.client.submit
+  // (frappe.client.submit requires fetching the doc first, but the modified
+  // timestamp can change between fetch and submit, causing "modified after opened" errors)
   async submitDocument(doctype: string, name: string): Promise<any> {
     try {
-      const doc = await this.getDocument(doctype, name);
-      const response = await this.axiosInstance.post('/api/method/frappe.client.submit', {
-        doc
+      const response = await this.axiosInstance.put(`/api/resource/${doctype}/${name}`, {
+        data: { docstatus: 1 }
       });
-      return response.data?.message || response.data?.data || response.data;
+      return response.data.data;
     } catch (error: any) {
       throw new Error(`Failed to submit ${doctype} ${name}: ${formatAxiosError(error)}`);
     }
@@ -112,7 +163,7 @@ class ERPNextClient {
       }
       
       if (filters) {
-        params['filters'] = JSON.stringify(filters);
+        params['filters'] = JSON.stringify(normalizeFilters(filters));
       }
       
       if (limit) {
@@ -123,6 +174,43 @@ class ERPNextClient {
       return response.data.data;
     } catch (error: any) {
       throw new Error(`Failed to get ${doctype} list: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Get count of documents for a doctype (handles child doctypes gracefully)
+  async getCount(doctype: string, filters?: Record<string, any>): Promise<number> {
+    try {
+      // Try frappe.client.get_count first (works for regular doctypes)
+      const args: Record<string, any> = { doctype };
+      if (filters) {
+        args.filters = normalizeFilters(filters);
+      }
+      const response = await this.axiosInstance.post('/api/method/frappe.client.get_count', args);
+      return response.data?.message ?? 0;
+    } catch (error: any) {
+      const status = error?.response?.status;
+      if (status === 403) {
+        // Permission denied — likely a child doctype. Fall back to get_list with count.
+        try {
+          const params: Record<string, any> = {
+            fields: JSON.stringify(["count(name) as total"]),
+            limit_page_length: 1
+          };
+          if (filters) {
+            params['filters'] = JSON.stringify(normalizeFilters(filters));
+          }
+          const listResponse = await this.axiosInstance.get(`/api/resource/${doctype}`, { params });
+          const data = listResponse.data?.data;
+          if (Array.isArray(data) && data.length > 0 && data[0].total !== undefined) {
+            return data[0].total;
+          }
+          return 0;
+        } catch {
+          // If list API also fails, re-throw the original error
+          throw new Error(`Failed to get count for ${doctype}: ${formatAxiosError(error)}`);
+        }
+      }
+      throw new Error(`Failed to get count for ${doctype}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -200,6 +288,39 @@ class ERPNextClient {
       return response.data.data;
     } catch (error: any) {
       throw new Error(`Failed to update ${doctype} ${name}: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Cancel a submitted document (docstatus = 2)
+  async cancelDocument(doctype: string, name: string): Promise<any> {
+    try {
+      const response = await this.axiosInstance.post('/api/method/frappe.client.cancel', {
+        doctype,
+        name
+      });
+      return response.data?.message || response.data?.data || response.data;
+    } catch (error: any) {
+      throw new Error(`Failed to cancel ${doctype} ${name}: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Delete a document
+  async deleteDocument(doctype: string, name: string): Promise<any> {
+    try {
+      const response = await this.axiosInstance.delete(`/api/resource/${doctype}/${name}`);
+      return response.data;
+    } catch (error: any) {
+      throw new Error(`Failed to delete ${doctype} ${name}: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Call a Frappe/ERPNext whitelisted method
+  async callMethod(method: string, args?: Record<string, any>): Promise<any> {
+    try {
+      const response = await this.axiosInstance.post(`/api/method/${method}`, args || {});
+      return response.data?.message || response.data;
+    } catch (error: any) {
+      throw new Error(`Failed to call method ${method}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -529,6 +650,80 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["doctype", "name"]
+        }
+      },
+      {
+        name: "cancel_document",
+        description: "Cancel a submitted document (docstatus = 2) in ERPNext",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType (e.g., Stock Entry, Sales Invoice)"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
+        name: "delete_document",
+        description: "Delete a document from ERPNext (use with caution)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
+        name: "get_count",
+        description: "Get the count of documents for a doctype (handles child doctypes gracefully)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType (e.g., Customer, Item, Item Default)"
+            },
+            filters: {
+              type: "object",
+              additionalProperties: true,
+              description: "Filters in the format {field: value} (optional)"
+            }
+          },
+          required: ["doctype"]
+        }
+      },
+      {
+        name: "call_method",
+        description: "Call a whitelisted Frappe/ERPNext API method",
+        inputSchema: {
+          type: "object",
+          properties: {
+            method: {
+              type: "string",
+              description: "Dotted method path (e.g., frappe.client.get_count)"
+            },
+            args: {
+              type: "object",
+              additionalProperties: true,
+              description: "Method arguments (optional)"
+            }
+          },
+          required: ["method"]
         }
       },
       {
@@ -905,6 +1100,166 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
     
+    case "cancel_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+
+      try {
+        const result = await erpnext.cancelDocument(doctype, name);
+        return {
+          content: [{
+            type: "text",
+            text: `Cancelled ${doctype} ${name}\n\n${JSON.stringify(result, null, 2)}`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to cancel ${doctype} ${name}: ${formatAxiosError(error)}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "delete_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+
+      try {
+        const result = await erpnext.deleteDocument(doctype, name);
+        return {
+          content: [{
+            type: "text",
+            text: `Deleted ${doctype} ${name}\n\n${JSON.stringify(result, null, 2)}`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to delete ${doctype} ${name}: ${formatAxiosError(error)}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "get_count": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const doctype = String(request.params.arguments?.doctype);
+      const filters = request.params.arguments?.filters as Record<string, any> | undefined;
+
+      if (!doctype) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype is required"
+        );
+      }
+
+      try {
+        const count = await erpnext.getCount(doctype, filters);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ doctype, count }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get count for ${doctype}: ${formatAxiosError(error)}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "call_method": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const method = String(request.params.arguments?.method);
+      const args = request.params.arguments?.args as Record<string, any> | undefined;
+
+      if (!method) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Method is required"
+        );
+      }
+
+      try {
+        const result = await erpnext.callMethod(method, args);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to call method ${method}: ${formatAxiosError(error)}`
+          }],
+          isError: true
+        };
+      }
+    }
+
     case "get_doctypes": {
       if (!erpnext.isAuthenticated()) {
         return {
