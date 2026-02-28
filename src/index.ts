@@ -23,6 +23,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
 
+const formatAxiosError = (error: any): string => {
+  const status = error?.response?.status;
+  const data = error?.response?.data;
+  if (data) {
+    try {
+      return `status=${status} response=${JSON.stringify(data)}`;
+    } catch {
+      return `status=${status} response=${String(data)}`;
+    }
+  }
+  return error?.message || 'Unknown error';
+};
+
 // ERPNext API client configuration
 class ERPNextClient {
   private baseUrl: string;
@@ -72,7 +85,20 @@ class ERPNextClient {
       const response = await this.axiosInstance.get(`/api/resource/${doctype}/${name}`);
       return response.data.data;
     } catch (error: any) {
-      throw new Error(`Failed to get ${doctype} ${name}: ${error?.message || 'Unknown error'}`);
+      throw new Error(`Failed to get ${doctype} ${name}: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Submit a document (docstatus = 1)
+  async submitDocument(doctype: string, name: string): Promise<any> {
+    try {
+      const doc = await this.getDocument(doctype, name);
+      const response = await this.axiosInstance.post('/api/method/frappe.client.submit', {
+        doc
+      });
+      return response.data?.message || response.data?.data || response.data;
+    } catch (error: any) {
+      throw new Error(`Failed to submit ${doctype} ${name}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -96,7 +122,60 @@ class ERPNextClient {
       const response = await this.axiosInstance.get(`/api/resource/${doctype}`, { params });
       return response.data.data;
     } catch (error: any) {
-      throw new Error(`Failed to get ${doctype} list: ${error?.message || 'Unknown error'}`);
+      throw new Error(`Failed to get ${doctype} list: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Get DocType metadata
+  async getDocTypeMeta(doctype: string): Promise<any> {
+    try {
+      const response = await this.axiosInstance.get(`/api/resource/DocType/${doctype}`);
+      return response.data.data;
+    } catch (error: any) {
+      // Fallback to getdoctype method (works when list/resource is restricted)
+      try {
+        const altResponse = await this.axiosInstance.get('/api/method/frappe.desk.form.load.getdoctype', {
+          params: { doctype }
+        });
+        const msg = altResponse.data?.message;
+        if (msg?.docs && Array.isArray(msg.docs) && msg.docs.length) {
+          return msg.docs[0];
+        }
+        if (msg?.doc) {
+          return msg.doc;
+        }
+        if (Array.isArray(msg) && msg.length) {
+          return msg[0];
+        }
+      } catch (altError: any) {
+        throw new Error(`Failed to get DocType ${doctype}: ${altError?.message || error?.message || 'Unknown error'}`);
+      }
+      throw new Error(`Failed to get DocType ${doctype}: ${formatAxiosError(error)}`);
+    }
+  }
+
+  // Get singleton document by doctype
+  async getSingleton(doctype: string): Promise<any> {
+    try {
+      const response = await this.axiosInstance.get(`/api/resource/${doctype}/${doctype}`);
+      return response.data.data;
+    } catch (error: any) {
+      // Fallback to getdoc method
+      try {
+        const altResponse = await this.axiosInstance.get('/api/method/frappe.desk.form.load.getdoc', {
+          params: { doctype, name: doctype }
+        });
+        const msg = altResponse.data?.message;
+        if (msg?.docs && Array.isArray(msg.docs) && msg.docs.length) {
+          return msg.docs[0];
+        }
+        if (msg?.doc) {
+          return msg.doc;
+        }
+      } catch (altError: any) {
+        throw new Error(`Failed to get singleton ${doctype}: ${altError?.message || error?.message || 'Unknown error'}`);
+      }
+      throw new Error(`Failed to get singleton ${doctype}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -108,7 +187,7 @@ class ERPNextClient {
       });
       return response.data.data;
     } catch (error: any) {
-      throw new Error(`Failed to create ${doctype}: ${error?.message || 'Unknown error'}`);
+      throw new Error(`Failed to create ${doctype}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -120,7 +199,7 @@ class ERPNextClient {
       });
       return response.data.data;
     } catch (error: any) {
-      throw new Error(`Failed to update ${doctype} ${name}: ${error?.message || 'Unknown error'}`);
+      throw new Error(`Failed to update ${doctype} ${name}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -135,7 +214,7 @@ class ERPNextClient {
       });
       return response.data.message;
     } catch (error: any) {
-      throw new Error(`Failed to run report ${reportName}: ${error?.message || 'Unknown error'}`);
+      throw new Error(`Failed to run report ${reportName}: ${formatAxiosError(error)}`);
     }
   }
 
@@ -156,7 +235,7 @@ class ERPNextClient {
       
       return [];
     } catch (error: any) {
-      console.error("Failed to get DocTypes:", error?.message || 'Unknown error');
+      console.error("Failed to get DocTypes:", formatAxiosError(error));
       
       // Try an alternative approach if the first one fails
       try {
@@ -279,7 +358,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     } catch (error: any) {
       throw new McpError(
         ErrorCode.InternalError,
-        `Failed to fetch DocTypes: ${error?.message || 'Unknown error'}`
+        `Failed to fetch DocTypes: ${formatAxiosError(error)}`
       );
     }
   } else {
@@ -294,7 +373,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       } catch (error: any) {
         throw new McpError(
           ErrorCode.InvalidRequest,
-          `Failed to fetch ${doctype} ${name}: ${error?.message || 'Unknown error'}`
+          `Failed to fetch ${doctype} ${name}: ${formatAxiosError(error)}`
         );
       }
     }
@@ -375,6 +454,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: "get_document",
+        description: "Get a single document by doctype and name",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType (e.g., Customer, Item)"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
         name: "create_document",
         description: "Create a new document in ERPNext",
         inputSchema: {
@@ -417,6 +514,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: "submit_document",
+        description: "Submit a document (docstatus = 1) in ERPNext",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType (e.g., Purchase Order, Sales Invoice)"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
         name: "run_report",
         description: "Run an ERPNext report",
         inputSchema: {
@@ -444,6 +559,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
  */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   switch (request.params.name) {
+    case "get_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+
+      try {
+        const doc = await erpnext.getDocument(doctype, name);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(doc, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get ${doctype} ${name}: ${formatAxiosError(error)}`
+          }],
+          isError: true
+        };
+      }
+    }
+
     case "get_documents": {
       if (!erpnext.isAuthenticated()) {
         return {
@@ -468,6 +623,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       
       try {
+        // Use DocType metadata to detect singletons
+        try {
+          const meta = await erpnext.getDocTypeMeta(doctype);
+          if (meta?.is_single) {
+            const doc = await erpnext.getSingleton(doctype);
+            let result: any = doc;
+            if (fields && fields.length) {
+              result = fields.reduce((acc: any, field: string) => {
+                acc[field] = doc?.[field];
+                return acc;
+              }, {});
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify([result], null, 2)
+              }]
+            };
+          }
+        } catch {
+          // Ignore metadata errors and fall back to list API
+        }
+
         const documents = await erpnext.getDocList(doctype, filters, fields, limit);
         return {
           content: [{
@@ -479,7 +657,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Failed to get ${doctype} documents: ${error?.message || 'Unknown error'}`
+            text: `Failed to get ${doctype} documents: ${formatAxiosError(error)}`
           }],
           isError: true
         };
@@ -519,13 +697,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Failed to create ${doctype}: ${error?.message || 'Unknown error'}`
+            text: `Failed to create ${doctype}: ${formatAxiosError(error)}`
           }],
           isError: true
         };
       }
     }
-    
+
+    case "submit_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+
+      try {
+        const result = await erpnext.submitDocument(doctype, name);
+        return {
+          content: [{
+            type: "text",
+            text: `Submitted ${doctype} ${name}\n\n${JSON.stringify(result, null, 2)}`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to submit ${doctype} ${name}: ${formatAxiosError(error)}`
+          }],
+          isError: true
+        };
+      }
+    }
+
     case "update_document": {
       if (!erpnext.isAuthenticated()) {
         return {
@@ -560,7 +778,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Failed to update ${doctype} ${name}: ${error?.message || 'Unknown error'}`
+            text: `Failed to update ${doctype} ${name}: ${formatAxiosError(error)}`
           }],
           isError: true
         };
@@ -600,7 +818,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Failed to run report ${reportName}: ${error?.message || 'Unknown error'}`
+            text: `Failed to run report ${reportName}: ${formatAxiosError(error)}`
           }],
           isError: true
         };
@@ -628,7 +846,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       
       try {
-        // Get a sample document to understand the fields
+        // Prefer DocType metadata (works even when no documents exist)
+        try {
+          const meta = await erpnext.getDocTypeMeta(doctype);
+          if (meta?.fields && Array.isArray(meta.fields)) {
+            const fields = meta.fields.map((field: any) => ({
+              fieldname: field.fieldname,
+              fieldtype: field.fieldtype,
+              reqd: field.reqd ?? 0,
+              options: field.options ?? null
+            }));
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(fields, null, 2)
+              }]
+            };
+          }
+        } catch {
+          // Ignore metadata errors and fall back to sample document
+        }
+
+        // Fallback: Get a sample document to understand the fields
         const documents = await erpnext.getDocList(doctype, {}, ["*"], 1);
         
         if (!documents || documents.length === 0) {
@@ -659,7 +898,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Failed to get fields for ${doctype}: ${error?.message || 'Unknown error'}`
+            text: `Failed to get fields for ${doctype}: ${formatAxiosError(error)}`
           }],
           isError: true
         };
@@ -689,7 +928,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Failed to get DocTypes: ${error?.message || 'Unknown error'}`
+            text: `Failed to get DocTypes: ${formatAxiosError(error)}`
           }],
           isError: true
         };
